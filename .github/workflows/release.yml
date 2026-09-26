@@ -11,7 +11,7 @@ env:
   PROJECT_NAME: boringNotch
   BETA_CHANNEL_NAME: beta
   RELEASE_COMMAND: /release
-  CODE_SIGN_IDENTITY: "Apple Development"
+  CODE_SIGN_IDENTITY: "Developer ID Application"
   XCODE_VERSION: "16.4"
 
 permissions:
@@ -51,7 +51,7 @@ jobs:
           HEAD_REPO=$(echo "$PR_DATA" | jq -r '.head_repo')
           BASE_REPO=$(echo "$PR_DATA" | jq -r '.base_repo')
 
-          if [[ "$HEAD_REPO" == "$REPO" && "$BASE_REPO" == "$REPO" && "$HEAD_REF" == "dev" && "$BASE_REF" == "main" ]]; then
+          if [[ "$HEAD_REPO" == "$REPO" && "$BASE_REPO" == "$REPO" && "$HEAD_REF" != "main" && "$BASE_REF" == "main" ]]; then
             IS_ELIGIBLE_PR=true
           fi
 
@@ -166,7 +166,11 @@ jobs:
           PR_NUMBER="${{ github.event.issue.number }}"
           REPO="${{ github.repository }}"
           TITLE=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.title // "Release"')
-          BODY=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // "- No release notes provided"')
+          BODY=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')
+          if [[ -z "${BODY//[[:space:]]/}" ]]; then
+            echo "::error::The release PR body must include release notes"
+            exit 1
+          fi
 
           # Strip H1 headings for GitHub release notes
           BODY_GITHUB=$(printf '%s' "$BODY" | sed '/^# /d' | perl -pe 's#<h1[^>]*>.*?</h1>##gi')
@@ -199,6 +203,10 @@ jobs:
           HEAD_REF: ${{ steps.pr_info.outputs.head_ref }}
         run: |
           set -euo pipefail
+          if [[ -z "$GITHUB_TOKEN" ]]; then
+            echo "::error::The RELEASE_TOKEN secret is required to sync the stable release branch"
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config --global credential.https://github.com.helper \
@@ -220,10 +228,15 @@ jobs:
       build_number: ${{ needs.preparation.outputs.build_number }}
       xcode_version: ${{ needs.preparation.outputs.xcode_version }}
       code_sign_identity: ${{ needs.preparation.outputs.code_sign_identity }}
+      export_method: developer-id
+      notarize: true
     secrets:
-      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-      P12_PASSWORD:              ${{ secrets.P12_PASSWORD }}
+      DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+      DEVELOPER_ID_APPLICATION_P12_PASSWORD:       ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
       KEYCHAIN_PASSWORD:         ${{ secrets.KEYCHAIN_PASSWORD }}
+      NOTARY_API_KEY_BASE64:     ${{ secrets.NOTARY_API_KEY_BASE64 }}
+      NOTARY_API_KEY_ID:         ${{ secrets.NOTARY_API_KEY_ID }}
+      NOTARY_ISSUER_ID:          ${{ secrets.NOTARY_ISSUER_ID }}
 
   publish:
     name: Publish release
@@ -249,6 +262,15 @@ jobs:
         env:
           RELEASE_NOTES: ${{ needs.preparation.outputs.release_notes }}
         run: printf '%s' "$RELEASE_NOTES" > Release/boringNotch.html
+
+      - name: Validate Sparkle signing key
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.PRIVATE_SPARKLE_KEY }}
+        run: |
+          if [[ -z "$SPARKLE_PRIVATE_KEY" ]]; then
+            echo "::error::The PRIVATE_SPARKLE_KEY secret is required to sign the release appcast"
+            exit 1
+          fi
 
       - name: Build Sparkle generate_appcast from source
         run: |
@@ -348,8 +370,8 @@ jobs:
           fi
           printf '%s' "$SPARKLE_PRIVATE_KEY" | "$RUNNER_TEMP/generate_appcast" \
             --ed-key-file - \
-            --link "https://github.com/TheBoredTeam/boring.notch/releases" \
-            --download-url-prefix "https://github.com/TheBoredTeam/boring.notch/releases/download/v${VERSION}/" \
+            --link "https://github.com/${GITHUB_REPOSITORY}/releases" \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/" \
             --embed-release-notes \
             "${CHANNEL_ARGS[@]}" \
             -o updater/appcast.xml \
@@ -385,13 +407,14 @@ jobs:
           if [[ "${IS_BETA}" == "true" ]]; then
             RELEASE_FLAGS=(--prerelease)
           fi
-          gh release create "v${VERSION}" Release/boringNotch.dmg \
+          gh release create "v${VERSION}" Release/boringNotch.dmg updater/appcast.xml \
             --title "v${VERSION} - ${TITLE}" \
             --notes "$NOTES" \
             "${RELEASE_FLAGS[@]}"
 
   upgrade-brew:
     name: Update Homebrew cask
+    if: ${{ github.repository == 'TheBoredTeam/boring.notch' }}
     needs: [preparation, publish]
     runs-on: ubuntu-latest
     env:
@@ -428,12 +451,6 @@ jobs:
             depends_on macos: :sonoma
             app "Notch.app"
             
-            postflight do
-              app_path = appdir/"Notch.app"
-              next unless app_path.exist?
-              system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", app_path]
-            end
-
             uninstall quit: "theboringteam.boringnotch"
 
             zap trash: [

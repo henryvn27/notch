@@ -19,13 +19,31 @@ on:
         required: false
         type: string
         default: "Apple Development"
+      export_method:
+        required: false
+        type: string
+        default: "development"
+      notarize:
+        required: false
+        type: boolean
+        default: false
     secrets:
       BUILD_CERTIFICATE_BASE64:
-        required: true
+        required: false
       P12_PASSWORD:
-        required: true
+        required: false
       KEYCHAIN_PASSWORD:
-        required: true
+        required: false
+      DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64:
+        required: false
+      DEVELOPER_ID_APPLICATION_P12_PASSWORD:
+        required: false
+      NOTARY_API_KEY_BASE64:
+        required: false
+      NOTARY_API_KEY_ID:
+        required: false
+      NOTARY_ISSUER_ID:
+        required: false
 
 jobs:
   build:
@@ -34,7 +52,8 @@ jobs:
       contents: write
     env:
       PROJECT_NAME: boringNotch
-      EXPORT_METHOD: development
+      APP_NAME: Notch
+      EXPORT_METHOD: ${{ inputs.export_method }}
       VERSION_INPUT: ${{ inputs.version }}
       BUILD_NUMBER_INPUT: ${{ inputs.build_number }}
       DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM_ID }}
@@ -45,6 +64,48 @@ jobs:
         with:
           ref: ${{ inputs.head_ref }}
 
+      - name: Validate signing prerequisites
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          NOTARY_API_KEY_BASE64: ${{ secrets.NOTARY_API_KEY_BASE64 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          EXPORT_METHOD: ${{ inputs.export_method }}
+          NOTARIZE: ${{ inputs.notarize }}
+        run: |
+          set -euo pipefail
+          if [[ "$EXPORT_METHOD" == "developer-id" && "$CODE_SIGN_IDENTITY" != "Developer ID Application" ]]; then
+            echo "::error::Developer ID exports must use the Developer ID Application identity"
+            exit 1
+          fi
+          if [[ "$CODE_SIGN_IDENTITY" == "Developer ID Application" ]]; then
+            REQUIRED_SIGNING_VALUES=(DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 DEVELOPER_ID_APPLICATION_P12_PASSWORD KEYCHAIN_PASSWORD DEVELOPMENT_TEAM)
+          else
+            REQUIRED_SIGNING_VALUES=(BUILD_CERTIFICATE_BASE64 P12_PASSWORD KEYCHAIN_PASSWORD DEVELOPMENT_TEAM)
+          fi
+          for name in "${REQUIRED_SIGNING_VALUES[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Required release signing configuration ${name} is missing"
+              exit 1
+            fi
+          done
+          if [[ "$NOTARIZE" == "true" ]]; then
+            if [[ "$EXPORT_METHOD" != "developer-id" ]]; then
+              echo "::error::Notarization requires the developer-id export method"
+              exit 1
+            fi
+            for name in NOTARY_API_KEY_BASE64 NOTARY_API_KEY_ID NOTARY_ISSUER_ID; do
+              if [[ -z "${!name}" ]]; then
+                echo "::error::Required notarization secret ${name} is missing"
+                exit 1
+              fi
+            done
+          fi
+
       - name: Resolve Swift packages
         run: xcodebuild -resolvePackageDependencies -project ${{ env.PROJECT_NAME }}.xcodeproj
 
@@ -53,15 +114,35 @@ jobs:
           BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_APPLICATION_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
         run: |
+          if [[ "$CODE_SIGN_IDENTITY" == "Developer ID Application" ]]; then
+            CERTIFICATE_BASE64="$DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64"
+            CERTIFICATE_PASSWORD="$DEVELOPER_ID_APPLICATION_P12_PASSWORD"
+          else
+            CERTIFICATE_BASE64="$BUILD_CERTIFICATE_BASE64"
+            CERTIFICATE_PASSWORD="$P12_PASSWORD"
+          fi
           CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
           KC="$RUNNER_TEMP/app-signing.keychain-db"
-          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          echo -n "$CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
           security set-keychain-settings -lut 21600 "$KC"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
-          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security import "$CERT_PATH" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KC"
           security list-keychain -d user -s "$KC"
+          if [[ "$CODE_SIGN_IDENTITY" == "Developer ID Application" ]]; then
+            IDENTITIES="$(security find-identity -v -p codesigning "$KC")"
+            printf '%s\n' "$IDENTITIES"
+            DEVELOPER_IDENTITY="$(printf '%s\n' "$IDENTITIES" | awk -F'"' '/Developer ID Application:/ { print $2; exit }')"
+            if [[ -z "$DEVELOPER_IDENTITY" ]]; then
+              echo "::error::The imported certificate does not contain a Developer ID Application identity"
+              exit 1
+            fi
+            echo "DEVELOPER_ID_SIGNING_IDENTITY=$DEVELOPER_IDENTITY" >> "$GITHUB_ENV"
+          fi
 
       - name: Select Xcode ${{ env.XCODE_VERSION }}
         run: |
@@ -143,6 +224,21 @@ jobs:
             -exportPath Release \
             -exportOptionsPlist "$RUNNER_TEMP/export_options.plist"
 
+      - name: Verify exported app signature
+        run: |
+          set -euo pipefail
+          APP_PATH="Release/${APP_NAME}.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          if [[ "$EXPORT_METHOD" == "developer-id" ]]; then
+            SIGNATURE_INFO="$(codesign -dv --verbose=4 "$APP_PATH" 2>&1)"
+            printf '%s\n' "$SIGNATURE_INFO" | grep -F 'Authority=Developer ID Application:'
+            APP_TEAM="$(printf '%s\n' "$SIGNATURE_INFO" | sed -n 's/^TeamIdentifier=//p' | head -n 1)"
+            if [[ "$APP_TEAM" != "$DEVELOPMENT_TEAM" ]]; then
+              echo "::error::Signed app team ${APP_TEAM:-missing} does not match DEVELOPMENT_TEAM"
+              exit 1
+            fi
+          fi
+
       - name: Verify generate_appcast exists
         run: |
           if [ ! -x Configuration/sparkle/generate_appcast ]; then
@@ -158,9 +254,39 @@ jobs:
           python3 -m pip install --require-hashes -r Configuration/dmg/requirements.txt
           chmod +x Configuration/dmg/create_dmg.sh
           ./Configuration/dmg/create_dmg.sh \
-            "Release/${{ env.PROJECT_NAME }}.app" \
+            "Release/${{ env.APP_NAME }}.app" \
             "Release/${{ env.PROJECT_NAME }}.dmg" \
-            "${{ env.PROJECT_NAME }} ${{ env.VERSION_INPUT }}"
+            "${{ env.APP_NAME }} ${{ env.VERSION_INPUT }}"
+
+      - name: Sign, notarize, and staple release DMG
+        if: ${{ inputs.notarize }}
+        env:
+          NOTARY_API_KEY_BASE64: ${{ secrets.NOTARY_API_KEY_BASE64 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          API_KEY_PATH="$RUNNER_TEMP/notary-api-key.p8"
+          DMG_PATH="Release/${PROJECT_NAME}.dmg"
+          trap 'rm -f "$API_KEY_PATH"' EXIT
+          printf '%s' "$NOTARY_API_KEY_BASE64" | base64 --decode > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+
+          codesign --force --sign "$DEVELOPER_ID_SIGNING_IDENTITY" --timestamp "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+          xcrun notarytool submit "$DMG_PATH" \
+            --key "$API_KEY_PATH" \
+            --key-id "$NOTARY_API_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait \
+            --timeout 2h \
+            --output-format json > "$RUNNER_TEMP/notary-submission.json"
+          cat "$RUNNER_TEMP/notary-submission.json"
+          python3 -c 'import json, sys; result = json.load(open(sys.argv[1])); status = result.get("status"); print(f"Notarization status: {status}"); sys.exit(0 if status == "Accepted" else 1)' "$RUNNER_TEMP/notary-submission.json"
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG_PATH"
+          hdiutil verify "$DMG_PATH"
 
       - name: Upload DMG
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -172,4 +298,4 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.PROJECT_NAME }}.app
-          path: Release/${{ env.PROJECT_NAME }}.app
+          path: Release/${{ env.APP_NAME }}.app
