@@ -33,8 +33,6 @@ struct ContentView: View {
 
     @Namespace var albumArtNamespace
 
-    @Default(.useMusicVisualizer) var useMusicVisualizer
-
     @Default(.showNotHumanFace) var showNotHumanFace
     @Default(.codexShowIdleUsage) private var codexShowIdleUsage
     @Default(.codexClosedContentMode) private var codexClosedContentMode
@@ -139,7 +137,10 @@ struct ContentView: View {
                     )
                 
                 mainLayout
-                    .frame(height: vm.notchState == .open ? vm.notchSize.height : nil)
+                    .frame(
+                        height: vm.notchState == .open ? vm.notchSize.height : nil,
+                        alignment: .top
+                    )
                     .conditionalModifier(true) { view in
                         return view
                             .animation(vm.notchState == .open ? NotchMotion.open : NotchMotion.close, value: vm.notchState)
@@ -318,7 +319,11 @@ struct ContentView: View {
                           BoringFaceAnimation()
                        } else if vm.notchState == .open {
                            BoringHeader()
-                               .frame(height: max(24, vm.effectiveClosedNotchHeight))
+                               .padding(.top, openNotchHeaderTopInset)
+                               .frame(
+                                   height: max(24, vm.effectiveClosedNotchHeight) + openNotchHeaderTopInset,
+                                   alignment: .top
+                               )
                                .opacity(gestureProgress != 0 ? 1.0 - min(abs(gestureProgress) * 0.1, 0.3) : 1.0)
                                .conditionalModifier(
                                    Defaults[.closeGestureEnabled]
@@ -451,7 +456,7 @@ struct ContentView: View {
                         {
                             MarqueeText(
                                 .constant(musicManager.songTitle),
-                                textColor: Defaults[.coloredSpectrogram]
+                                textColor: Defaults[.playerColorTinting]
                                     ? Color(nsColor: musicManager.avgColor) : Color.gray,
                                 minDuration: 0.4,
                                 frameWidth: 100
@@ -467,7 +472,7 @@ struct ContentView: View {
                                 .lineLimit(1)
                                 .truncationMode(.tail)
                                 .foregroundStyle(
-                                    Defaults[.coloredSpectrogram]
+                                    Defaults[.playerColorTinting]
                                         ? Color(nsColor: musicManager.avgColor)
                                         : Color.gray
                                 )
@@ -491,21 +496,10 @@ struct ContentView: View {
             HStack {
                 if codexClosedContentMode == .music && Defaults[.codexShowPace] {
                     CodexCompactPaceWing(height: vm.effectiveClosedNotchHeight)
-                } else if useMusicVisualizer {
-                    Rectangle()
-                        .fill(
-                            Defaults[.coloredSpectrogram]
-                                ? Color(nsColor: musicManager.avgColor).gradient
-                                : Color.gray.gradient
-                        )
-                        .frame(width: 50, alignment: .center)
-                        .matchedGeometryEffect(id: "spectrum", in: albumArtNamespace)
-                        .mask {
-                            AudioSpectrumView(isPlaying: $musicManager.isPlaying)
-                                .frame(width: 16, height: 12)
-                        }
                 } else {
-                    LottieAnimationContainer()
+                    Image(systemName: "music.note")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
